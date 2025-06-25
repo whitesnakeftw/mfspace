@@ -1,5 +1,6 @@
 import re
-from typing import Dict, Any, Optional
+import base64
+from typing import Any, Dict, Optional
 from urllib.parse import urlparse, quote
 
 from mediaflow_proxy.extractors.base import BaseExtractor, ExtractorError
@@ -30,46 +31,70 @@ class DLHDExtractor(BaseExtractor):
         try:
             # Channel URL is required and serves as the referer
             channel_url = url
-            player_origin = self._get_origin(channel_url)
+            channel_origin = self._get_origin(channel_url) # Channel page origin
 
             # Check for direct parameters
-            player_url = kwargs.get("player_url")
-            stream_url = kwargs.get("stream_url")
-            auth_url_base = kwargs.get("auth_url_base")
+            player_url_from_arg = kwargs.get("player_url")
+            stream_url_from_arg = kwargs.get("stream_url")
+            auth_url_base_from_arg = kwargs.get("auth_url_base")
+
+            current_player_url_for_processing: str
 
             # If player URL not provided, extract it from channel page
-            if not player_url:
+            if not player_url_from_arg:
                 # Get the channel page to extract the player iframe URL
                 channel_headers = {
-                    "referer": player_origin + "/",
-                    "origin": player_origin,
+                    "referer": channel_origin + "/",
+                    "origin": channel_origin,
                     "user-agent": self.base_headers["user-agent"],
                 }
 
                 channel_response = await self._make_request(channel_url, headers=channel_headers)
-                player_url = self._extract_player_url(channel_response.text)
+                extracted_iframe_url = self._extract_player_url(channel_response.text)
 
-                if not player_url:
+                if not extracted_iframe_url:
                     raise ExtractorError("Could not extract player URL from channel page")
+                current_player_url_for_processing = extracted_iframe_url
+            else:
+                current_player_url_for_processing = player_url_from_arg
 
-                if not re.search(r"/stream/([a-zA-Z0-9-]+)", player_url):
-                    iframe_player_url = await self._handle_playnow(player_url, player_origin)
-                    player_origin = self._get_origin(player_url)
-                    player_url = iframe_player_url
-
+            # Attempt 1: _handle_vecloud with current_player_url_for_processing
+            # The referer for _handle_vecloud is the origin of the channel page (channel_origin) 
+            # or the origin of the player itself if it is a /stream/ URL.
             try:
-                return await self._handle_vecloud(player_url, player_origin + "/")
-            except Exception as e:
-                pass
+                referer_for_vecloud = channel_origin + "/"
+                if re.search(r"/stream/([a-zA-Z0-9-]+)", current_player_url_for_processing):
+                    referer_for_vecloud = self._get_origin(current_player_url_for_processing) + "/"
+                return await self._handle_vecloud(current_player_url_for_processing, referer_for_vecloud)
+            except Exception:
+                pass # Fail, Continue
+                
+            # Attempt 2: If _handle_vecloud fail and the URL is not /stream/, try _handle_playnow
+            # and then _handle_vecloud again with the URL resulting from playnow.
+            if not re.search(r"/stream/([a-zA-Z0-9-]+)", current_player_url_for_processing):
+                try:
+                    playnow_derived_player_url = await self._handle_playnow(current_player_url_for_processing, channel_origin + "/")
+                    if re.search(r"/stream/([a-zA-Z0-9-]+)", playnow_derived_player_url):
+                        try:
+                            referer_for_vecloud_after_playnow = self._get_origin(playnow_derived_player_url) + "/"
+                            return await self._handle_vecloud(playnow_derived_player_url, referer_for_vecloud_after_playnow)
+                        except Exception:
+                            pass 
+                except Exception:
+                    pass
 
+            # If all previous attempts have failed, proceed with standard authentication.
+            player_url_for_auth = current_player_url_for_processing
+            player_origin_for_auth = self._get_origin(player_url_for_auth)
+            
             # Get player page to extract authentication information
             player_headers = {
-                "referer": player_origin + "/",
-                "origin": player_origin,
+                "referer": player_origin_for_auth + "/",
+                "origin": player_origin_for_auth,
                 "user-agent": self.base_headers["user-agent"],
             }
 
-            player_response = await self._make_request(player_url, headers=player_headers)
+            player_response = await self._make_request(player_url_for_auth, headers=player_headers)
             player_content = player_response.text
 
             # Extract authentication details from script tag
@@ -78,62 +103,63 @@ class DLHDExtractor(BaseExtractor):
                 raise ExtractorError("Failed to extract authentication data from player")
 
             # Extract auth URL base if not provided
-            if not auth_url_base:
-                auth_url_base = self._extract_auth_url_base(player_content)
+            final_auth_url_base = auth_url_base_from_arg
+            if not final_auth_url_base:
+                final_auth_url_base = self._extract_auth_url_base(player_content)
 
             # If still no auth URL base, try to derive from stream URL or player URL
-            if not auth_url_base:
-                if stream_url:
-                    auth_url_base = self._get_origin(stream_url)
+            if not final_auth_url_base:
+                if stream_url_from_arg:
+                    final_auth_url_base = self._get_origin(stream_url_from_arg)
                 else:
                     # Try to extract from player URL structure
-                    player_domain = self._get_origin(player_url)
+                    player_domain_for_auth_derive = self._get_origin(player_url_for_auth)
                     # Attempt to construct a standard auth domain
-                    auth_url_base = self._derive_auth_url_base(player_domain)
+                    final_auth_url_base = self._derive_auth_url_base(player_domain_for_auth_derive)
 
-                if not auth_url_base:
+                if not final_auth_url_base:
                     raise ExtractorError("Could not determine auth URL base")
 
             # Construct auth URL
             auth_url = (
-                f"{auth_url_base}/auth.php?channel_id={auth_data['channel_key']}"
+                f"{final_auth_url_base}/auth.php?channel_id={auth_data['channel_key']}"
                 f"&ts={auth_data['auth_ts']}&rnd={auth_data['auth_rnd']}"
                 f"&sig={quote(auth_data['auth_sig'])}"
             )
 
             # Make auth request
-            player_origin = self._get_origin(player_url)
-            auth_headers = {
-                "referer": player_origin + "/",
-                "origin": player_origin,
+            auth_req_headers = {
+                "referer": player_origin_for_auth + "/",
+                "origin": player_origin_for_auth,
                 "user-agent": self.base_headers["user-agent"],
             }
 
-            auth_response = await self._make_request(auth_url, headers=auth_headers)
+            auth_response = await self._make_request(auth_url, headers=auth_req_headers)
 
             # Check if authentication succeeded
             if auth_response.json().get("status") != "ok":
                 raise ExtractorError("Authentication failed")
 
             # If no stream URL provided, look up the server and generate the stream URL
-            if not stream_url:
-                stream_url = await self._lookup_server(
-                    lookup_url_base=player_origin,
-                    auth_url_base=auth_url_base,
+            final_stream_url = stream_url_from_arg
+            if not final_stream_url:
+                final_stream_url = await self._lookup_server(
+                    lookup_url_base=player_origin_for_auth,
+                    auth_url_base=final_auth_url_base,
                     auth_data=auth_data,
-                    headers=auth_headers,
+                    headers=auth_req_headers,
                 )
 
             # Set up the final stream headers
             stream_headers = {
-                "referer": player_url,
-                "origin": player_origin,
+                "referer": player_url_for_auth,
+                "origin": player_origin_for_auth,
                 "user-agent": self.base_headers["user-agent"],
             }
 
             # Return the stream URL with headers
             return {
-                "destination_url": stream_url,
+                "destination_url": final_stream_url,
                 "request_headers": stream_headers,
                 "mediaflow_endpoint": self.mediaflow_endpoint,
             }
@@ -281,30 +307,49 @@ class DLHDExtractor(BaseExtractor):
     def _extract_auth_data(self, html_content: str) -> Dict[str, str]:
         """Extract authentication data from player page."""
         try:
-            # Extract channel key
             channel_key_match = re.search(r'var\s+channelKey\s*=\s*["\']([^"\']+)["\']', html_content)
-            # Extract auth timestamp
+            if not channel_key_match:
+                return {}
+            channel_key = channel_key_match.group(1)
+
+            # New pattern with atob
+            auth_ts_match = re.search(r'var\s+__c\s*=\s*atob\([\'"]([^\'"]+)[\'"]\)', html_content)
+            auth_rnd_match = re.search(r'var\s+__d\s*=\s*atob\([\'"]([^\'"]+)[\'"]\)', html_content)
+            auth_sig_match = re.search(r'var\s+__e\s*=\s*atob\([\'"]([^\'"]+)[\'"]\)', html_content)
+
+            if all([auth_ts_match, auth_rnd_match, auth_sig_match]):
+                return {
+                    "channel_key": channel_key,
+                    "auth_ts": base64.b64decode(auth_ts_match.group(1)).decode("utf-8"),
+                    "auth_rnd": base64.b64decode(auth_rnd_match.group(1)).decode("utf-8"),
+                    "auth_sig": base64.b64decode(auth_sig_match.group(1)).decode("utf-8"),
+                }
+
+            # Original pattern
             auth_ts_match = re.search(r'var\s+authTs\s*=\s*["\']([^"\']+)["\']', html_content)
-            # Extract auth random value
             auth_rnd_match = re.search(r'var\s+authRnd\s*=\s*["\']([^"\']+)["\']', html_content)
-            # Extract auth signature
             auth_sig_match = re.search(r'var\s+authSig\s*=\s*["\']([^"\']+)["\']', html_content)
 
-            if not all([channel_key_match, auth_ts_match, auth_rnd_match, auth_sig_match]):
-                return {}
-
-            return {
-                "channel_key": channel_key_match.group(1),
-                "auth_ts": auth_ts_match.group(1),
-                "auth_rnd": auth_rnd_match.group(1),
-                "auth_sig": auth_sig_match.group(1),
-            }
+            if all([auth_ts_match, auth_rnd_match, auth_sig_match]):
+                return {
+                    "channel_key": channel_key,
+                    "auth_ts": auth_ts_match.group(1),
+                    "auth_rnd": auth_rnd_match.group(1),
+                    "auth_sig": auth_sig_match.group(1),
+                }
+            return {}
         except Exception:
             return {}
 
     def _extract_auth_url_base(self, html_content: str) -> Optional[str]:
         """Extract auth URL base from player page script content."""
         try:
+            # New atob pattern for auth base URL
+            auth_url_base_match = re.search(r'var\s+__a\s*=\s*atob\([\'"]([^\'"]+)[\'"]\)', html_content)
+            if auth_url_base_match:
+                decoded_url = base64.b64decode(auth_url_base_match.group(1)).decode("utf-8")
+                return decoded_url.strip().rstrip("/")
+
             # Look for auth URL or domain in fetchWithRetry call or similar patterns
             auth_url_match = re.search(r'fetchWithRetry\([\'"]([^\'"]*/auth\.php)', html_content)
 
