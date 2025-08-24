@@ -37,7 +37,7 @@ class TestExtractor(BaseExtractor):
         response = session.get(url).text
         matches = re.search(r'pages/player.html#(http.+?)[&?]+ck=([^"&]+)', response)
         if matches:
-            mpd_url = matches[1]
+            mpd_url = re.sub(r'dc[ab]-rw-livedazn.cdn\.netrw\.it', 'dca-co-live-gcr.gcdn.co', matches[1])
             base64key = matches[2].replace('%3D', '=')
         else:
             print('\nNo MPD/keys found for:', url)
