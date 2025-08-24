@@ -1,3 +1,4 @@
+import asyncio
 import codecs
 import re
 from typing import AsyncGenerator
@@ -6,22 +7,26 @@ from urllib import parse
 from mediaflow_proxy.configs import settings
 from mediaflow_proxy.utils.crypto_utils import encryption_handler
 from mediaflow_proxy.utils.http_utils import encode_mediaflow_proxy_url, encode_stremio_proxy_url, get_original_scheme
+from mediaflow_proxy.utils.hls_prebuffer import hls_prebuffer
 
 
 class M3U8Processor:
-    def __init__(self, request, key_url: str = None):
+    def __init__(self, request, key_url: str = None, force_playlist_proxy: bool = None):
         """
         Initializes the M3U8Processor with the request and URL prefix.
 
         Args:
             request (Request): The incoming HTTP request.
             key_url (HttpUrl, optional): The URL of the key server. Defaults to None.
+            force_playlist_proxy (bool, optional): Force all playlist URLs to be proxied through MediaFlow. Defaults to None.
         """
         self.request = request
         self.key_url = parse.urlparse(key_url) if key_url else None
+        self.force_playlist_proxy = force_playlist_proxy
         self.mediaflow_proxy_url = str(
             request.url_for("hls_manifest_proxy").replace(scheme=get_original_scheme(request))
         )
+        self.playlist_url = None  # Will be set when processing starts
 
     async def process_m3u8(self, content: str, base_url: str) -> str:
         """
@@ -34,6 +39,9 @@ class M3U8Processor:
         Returns:
             str: The processed m3u8 content.
         """
+        # Store the playlist URL for prebuffering
+        self.playlist_url = base_url
+        
         lines = content.splitlines()
         processed_lines = []
         for line in lines:
@@ -43,6 +51,23 @@ class M3U8Processor:
                 processed_lines.append(await self.proxy_content_url(line, base_url))
             else:
                 processed_lines.append(line)
+        
+        # Pre-buffer segments if enabled and this is a playlist
+        if (settings.enable_hls_prebuffer and 
+            "#EXTM3U" in content and
+            self.playlist_url):
+            
+            # Extract headers from request for pre-buffering
+            headers = {}
+            for key, value in self.request.query_params.items():
+                if key.startswith("h_"):
+                    headers[key[2:]] = value
+            
+            # Start pre-buffering in background using the actual playlist URL
+            asyncio.create_task(
+                hls_prebuffer.prebuffer_playlist(self.playlist_url, headers)
+            )
+        
         return "\n".join(processed_lines)
 
     async def process_m3u8_streaming(
@@ -50,6 +75,7 @@ class M3U8Processor:
     ) -> AsyncGenerator[str, None]:
         """
         Processes the m3u8 content on-the-fly, yielding processed lines as they are read.
+        Optimized to avoid accumulating the entire playlist content in memory.
 
         Args:
             content_iterator: An async iterator that yields chunks of the m3u8 content.
@@ -58,8 +84,13 @@ class M3U8Processor:
         Yields:
             str: Processed lines of the m3u8 content.
         """
+        # Store the playlist URL for prebuffering
+        self.playlist_url = base_url
+        
         buffer = ""  # String buffer for decoded content
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        is_playlist_detected = False
+        is_prebuffer_started = False
 
         # Process the content chunk by chunk
         async for chunk in content_iterator:
@@ -69,6 +100,10 @@ class M3U8Processor:
             # Incrementally decode the chunk
             decoded_chunk = decoder.decode(chunk)
             buffer += decoded_chunk
+
+            # Check for playlist marker early to avoid accumulating content
+            if not is_playlist_detected and "#EXTM3U" in buffer:
+                is_playlist_detected = True
 
             # Process complete lines
             lines = buffer.split("\n")
@@ -81,6 +116,25 @@ class M3U8Processor:
 
                 # Keep the last line in the buffer (it might be incomplete)
                 buffer = lines[-1]
+
+            # Start pre-buffering early once we detect this is a playlist
+            # This avoids waiting until the entire playlist is processed
+            if (settings.enable_hls_prebuffer and 
+                is_playlist_detected and 
+                not is_prebuffer_started and
+                self.playlist_url):
+                
+                # Extract headers from request for pre-buffering
+                headers = {}
+                for key, value in self.request.query_params.items():
+                    if key.startswith("h_"):
+                        headers[key[2:]] = value
+                
+                # Start pre-buffering in background using the actual playlist URL
+                asyncio.create_task(
+                    hls_prebuffer.prebuffer_playlist(self.playlist_url, headers)
+                )
+                is_prebuffer_started = True
 
         # Process any remaining data in the buffer plus final bytes
         final_chunk = decoder.decode(b"", final=True)
@@ -146,8 +200,15 @@ class M3U8Processor:
         # Determine routing strategy based on configuration
         routing_strategy = settings.m3u8_content_routing
 
+        # Check if we should force MediaFlow proxy for all playlist URLs
+        if self.force_playlist_proxy:
+            return await self.proxy_url(full_url, base_url, use_full_url=True)
+
         # For playlist URLs, always use MediaFlow proxy regardless of strategy
-        if ".m3u" in full_url:
+        # Check for actual playlist file extensions, not just substring matches
+        parsed_url = parse.urlparse(full_url)
+        if (parsed_url.path.endswith((".m3u", ".m3u8", ".m3u_plus")) or
+            parse.parse_qs(parsed_url.query).get("type", [""])[0] in ["m3u", "m3u8", "m3u_plus"]):
             return await self.proxy_url(full_url, base_url, use_full_url=True)
 
         # Route non-playlist content URLs based on strategy
@@ -191,6 +252,8 @@ class M3U8Processor:
         has_encrypted = query_params.pop("has_encrypted", False)
         # Remove the response headers from the query params to avoid it being added to the consecutive requests
         [query_params.pop(key, None) for key in list(query_params.keys()) if key.startswith("r_")]
+        # Remove force_playlist_proxy to avoid it being added to subsequent requests
+        query_params.pop("force_playlist_proxy", None)
 
         return encode_mediaflow_proxy_url(
             self.mediaflow_proxy_url,

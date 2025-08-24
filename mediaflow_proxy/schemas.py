@@ -25,6 +25,9 @@ class GenerateUrlRequest(BaseModel):
     )
     ip: Optional[IPvAnyAddress] = Field(None, description="The IP address to restrict the URL to.")
     filename: Optional[str] = Field(None, description="Filename to be preserved for media players like Infuse.")
+    base64_encode_destination: Optional[bool] = Field(
+        False, description="Whether to encode the destination URL in base64 format before processing."
+    )
 
 
 class MultiUrlRequestItem(BaseModel):
@@ -64,6 +67,10 @@ class HLSManifestParams(GenericParams):
         None,
         description="The HLS Key URL to replace the original key URL. Defaults to None. (Useful for bypassing some sneaky protection)",
     )
+    force_playlist_proxy: Optional[bool] = Field(
+        None,
+        description="Force all playlist URLs to be proxied through MediaFlow regardless of m3u8_content_routing setting. Useful for IPTV m3u/m3u_plus formats that don't have clear URL indicators.",
+    )
 
 
 class MPDManifestParams(GenericParams):
@@ -89,7 +96,7 @@ class MPDSegmentParams(GenericParams):
 
 class ExtractorURLParams(GenericParams):
     host: Literal[
-        "Doodstream", "Mixdrop", "Uqload", "Streamtape", "Supervideo", "VixCloud", "Okru", "Maxstream", "LiveTV", "DLHD"
+        "Doodstream", "Mixdrop", "Uqload", "Streamtape", "Supervideo", "VixCloud", "Okru", "Maxstream", "LiveTV", "DLHD", "Fastream"
     ] = Field(..., description="The host to extract the URL from.")
     destination: str = Field(..., description="The URL of the stream.", alias="d")
     redirect_stream: bool = Field(False, description="Whether to redirect to the stream endpoint automatically.")

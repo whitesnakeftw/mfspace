@@ -85,13 +85,33 @@ async def handle_hls_stream_proxy(
     proxy_headers.request.update({"range": content_range})
 
     try:
+        # Auto-detect and resolve Vavoo links
+        if "vavoo.to" in hls_params.destination:
+            try:
+                from mediaflow_proxy.extractors.vavoo import VavooExtractor
+                vavoo_extractor = VavooExtractor(proxy_headers.request)
+                resolved_data = await vavoo_extractor.extract(hls_params.destination)
+                resolved_url = resolved_data["destination_url"]
+                logger.info(f"Auto-resolved Vavoo URL: {hls_params.destination} -> {resolved_url}")
+                # Update destination with resolved URL
+                hls_params.destination = resolved_url
+            except Exception as e:
+                logger.warning(f"Failed to auto-resolve Vavoo URL: {e}")
+                # Continue with original URL if resolution fails
+
+        # If force_playlist_proxy is enabled, skip detection and directly process as m3u8
+        if hls_params.force_playlist_proxy:
+            return await fetch_and_process_m3u8(
+                streamer, hls_params.destination, proxy_headers, request, hls_params.key_url, hls_params.force_playlist_proxy
+            )
+
         parsed_url = urlparse(hls_params.destination)
         # Check if the URL is a valid m3u8 playlist or m3u file
         if parsed_url.path.endswith((".m3u", ".m3u8", ".m3u_plus")) or parse_qs(parsed_url.query).get("type", [""])[
             0
         ] in ["m3u", "m3u8", "m3u_plus"]:
             return await fetch_and_process_m3u8(
-                streamer, hls_params.destination, proxy_headers, request, hls_params.key_url
+                streamer, hls_params.destination, proxy_headers, request, hls_params.key_url, hls_params.force_playlist_proxy
             )
 
         # Create initial streaming response to check content type
@@ -100,7 +120,7 @@ async def handle_hls_stream_proxy(
 
         if "mpegurl" in response_headers.get("content-type", "").lower():
             return await fetch_and_process_m3u8(
-                streamer, hls_params.destination, proxy_headers, request, hls_params.key_url
+                streamer, hls_params.destination, proxy_headers, request, hls_params.key_url, hls_params.force_playlist_proxy
             )
 
         return EnhancedStreamingResponse(
@@ -135,6 +155,20 @@ async def handle_stream_request(
     client, streamer = await setup_client_and_streamer()
 
     try:
+        # Auto-detect and resolve Vavoo links
+        if "vavoo.to" in video_url:
+            try:
+                from mediaflow_proxy.extractors.vavoo import VavooExtractor
+                vavoo_extractor = VavooExtractor(proxy_headers.request)
+                resolved_data = await vavoo_extractor.extract(video_url)
+                resolved_url = resolved_data["destination_url"]
+                logger.info(f"Auto-resolved Vavoo URL: {video_url} -> {resolved_url}")
+                # Update video_url with resolved URL
+                video_url = resolved_url
+            except Exception as e:
+                logger.warning(f"Failed to auto-resolve Vavoo URL: {e}")
+                # Continue with original URL if resolution fails
+
         await streamer.create_streaming_response(video_url, proxy_headers.request)
         response_headers = prepare_response_headers(streamer.response.headers, proxy_headers.response)
 
@@ -190,7 +224,7 @@ async def proxy_stream(method: str, destination: str, proxy_headers: ProxyReques
 
 
 async def fetch_and_process_m3u8(
-    streamer: Streamer, url: str, proxy_headers: ProxyRequestHeaders, request: Request, key_url: str = None
+    streamer: Streamer, url: str, proxy_headers: ProxyRequestHeaders, request: Request, key_url: str = None, force_playlist_proxy: bool = None
 ):
     """
     Fetches and processes the m3u8 playlist on-the-fly, converting it to an HLS playlist.
@@ -201,6 +235,7 @@ async def fetch_and_process_m3u8(
         proxy_headers (ProxyRequestHeaders): The headers to include in the request.
         request (Request): The incoming HTTP request.
         key_url (str, optional): The HLS Key URL to replace the original key URL. Defaults to None.
+        force_playlist_proxy (bool, optional): Force all playlist URLs to be proxied through MediaFlow. Defaults to None.
 
     Returns:
         Response: The HTTP response with the processed m3u8 playlist.
@@ -211,7 +246,7 @@ async def fetch_and_process_m3u8(
             await streamer.create_streaming_response(url, proxy_headers.request)
 
         # Initialize processor and response headers
-        processor = M3U8Processor(request, key_url)
+        processor = M3U8Processor(request, key_url, force_playlist_proxy)
         response_headers = {
             "content-disposition": "inline",
             "accept-ranges": "none",
