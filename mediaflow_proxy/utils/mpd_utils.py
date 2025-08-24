@@ -171,9 +171,11 @@ def process_content_protection(content_protection: Union[list[dict], dict], drm_
 
         elif "widevine" in scheme_id_uri or "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed" in scheme_id_uri:
             drm_info["drmSystem"] = "widevine"
-            pssh = protection.get("cenc:pssh", {}).get("#text")
-            if pssh:
-                drm_info["pssh"] = pssh
+            pssh_entry = protection.get("cenc:pssh")
+            if isinstance(pssh_entry, dict):  # handle empty cases
+                pssh = pssh_entry.get("#text")
+                if pssh:
+                    drm_info["pssh"] = pssh
 
         elif "playready" in scheme_id_uri or "9a04f079-9840-4286-ab92-e65be0885f95" in scheme_id_uri:
             drm_info["drmSystem"] = "playready"

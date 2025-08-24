@@ -192,6 +192,11 @@ def build_hls_playlist(mpd_dict: dict, profiles: list[dict], request: Request) -
             logger.warning(f"No segments found for profile {profile['id']}")
             continue
 
+        # Trim segments for live streams to mimic HLS sliding window behavior
+        # if mpd_dict.get("isLive", False):
+        #     window_size = 6  # keep last 6 segments (tune as needed)
+        #     segments = segments[-window_size:]
+
         # Add headers for only the first profile
         if index == 0:
             first_segment = segments[0]
